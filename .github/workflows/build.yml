@@ -1,0 +1,170 @@
+name: build-rusty-v8-android
+
+on:
+  workflow_dispatch:
+    inputs:
+      v8_version:
+        description: 'v8 crate version (e.g. 137.1.0)'
+        required: true
+        default: '137.1.0'
+      rust_version:
+        description: 'Rust toolchain version'
+        required: false
+        default: '1.93.0'
+      android_api_level:
+        description: 'Android API level'
+        required: false
+        default: '29'
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      ANDROID_TARGET: aarch64-linux-android
+      V8_VERSION: ${{ inputs.v8_version || '137.1.0' }}
+      RUST_VERSION: ${{ inputs.rust_version || '1.93.0' }}
+      ANDROID_API_LEVEL: ${{ inputs.android_api_level || '29' }}
+      NDK_REVISION: r27c
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set RELEASE_TAG
+        run: echo "RELEASE_TAG=rusty-v8-v${V8_VERSION}-android" >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/lib/android /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install system dependencies
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libclang-19-dev clang-19 ninja-build python3 unzip \
+            pkg-config libglib2.0-dev curl ca-certificates git
+
+      - name: Download prebuilt GN
+        run: |
+          set -eu
+          gn_dir="$RUNNER_TEMP/gn-bin"; mkdir -p "$gn_dir"
+          curl -fsSL "https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-amd64/+/latest" -o "$gn_dir/gn.zip"
+          cd "$gn_dir" && unzip -q gn.zip gn && chmod +x gn && ./gn --version
+          echo "GN=$gn_dir/gn" >> "$GITHUB_ENV"
+          echo "NINJA=$(command -v ninja)" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup target add "${ANDROID_TARGET}" --toolchain "${RUST_VERSION}"
+          rustup default "${RUST_VERSION}"
+
+      - name: Download Android NDK
+        run: |
+          set -eu
+          ndk_zip="$RUNNER_TEMP/android-ndk-${NDK_REVISION}.zip"
+          curl -fsSL "https://dl.google.com/android/repository/android-ndk-${NDK_REVISION}-linux.zip" -o "$ndk_zip"
+          unzip -q "$ndk_zip" -d "$RUNNER_TEMP"
+          ndk_dir="$RUNNER_TEMP/android-ndk-${NDK_REVISION}"
+          tc="$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "ANDROID_NDK_HOME=$ndk_dir"
+            echo "ANDROID_NDK_ROOT=$ndk_dir"
+            echo "CC_aarch64_linux_android=$tc/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
+            echo "CXX_aarch64_linux_android=$tc/aarch64-linux-android${ANDROID_API_LEVEL}-clang++"
+            echo "AR_aarch64_linux_android=$tc/llvm-ar"
+            echo "RANLIB_aarch64_linux_android=$tc/llvm-ranlib"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$tc/aarch64-linux-android${ANDROID_API_LEVEL}-clang"
+            echo "EXTRA_GN_ARGS=android_ndk_api_level=${ANDROID_API_LEVEL}"
+            sysroot="$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=--target=aarch64-linux-android${ANDROID_API_LEVEL} --sysroot=$sysroot -I$sysroot/usr/include -I$sysroot/usr/include/aarch64-linux-android"
+          } >> "$GITHUB_ENV"
+
+      - name: Clone rusty_v8 source and submodules
+        run: |
+          set -Eeuo pipefail
+          RV8_SRC="$RUNNER_TEMP/rusty_v8_src"
+          git clone --depth=1 --branch "v${V8_VERSION}" \
+            https://github.com/denoland/rusty_v8.git "$RV8_SRC"
+          for sm in build third_party/rust tools/clang buildtools third_party/icu \
+                    third_party/libc++/src third_party/libc++abi/src third_party/jinja2 \
+                    third_party/markupsafe third_party/abseil-cpp third_party/simdutf \
+                    third_party/fp16/src third_party/fast_float/src third_party/highway/src \
+                    third_party/partition_alloc third_party/libunwind/src \
+                    third_party/dragonbox/src third_party/llvm-libc/src; do
+            git -C "$RV8_SRC" submodule update --init --depth=1 "$sm" || echo "warn: $sm"
+          done
+          git -C "$RV8_SRC" submodule update --init --depth=1 v8
+          test -f "$RV8_SRC/v8/gni/v8.gni" || { echo "ERROR: v8/gni/v8.gni missing" >&2; exit 1; }
+          echo "rusty_v8 source ready: $(du -sh "$RV8_SRC" | cut -f1)"
+          echo "RV8_SRC=$RV8_SRC" >> "$GITHUB_ENV"
+
+      - name: Prepare NDK symlinks and host sysroot
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RV8_SRC/third_party/android_toolchain"
+          ln -sfn "$ANDROID_NDK_ROOT" "$RV8_SRC/third_party/android_toolchain/ndk"
+          ln -sfn "$ANDROID_NDK_ROOT" "$RV8_SRC/third_party/android_ndk"
+          if [ -f "$RV8_SRC/build/linux/sysroot_scripts/install-sysroot.py" ]; then
+            ( cd "$RV8_SRC" && python3 build/linux/sysroot_scripts/install-sysroot.py --arch=amd64 ) || echo "warn: sysroot script failed"
+          fi
+          FILTER="$RV8_SRC/build/rust/gni_impl/filter_clang_args.py"
+          [ -f "$FILTER" ] && python3 "$GITHUB_WORKSPACE/scripts/patch-bindgen-filter.py" "$FILTER" || true
+          CONFIG_GNI="$RV8_SRC/build/config/android/config.gni"
+          [ -f "$CONFIG_GNI" ] && python3 "$GITHUB_WORKSPACE/scripts/patch-android-ndk-version.py" "$CONFIG_GNI" "${NDK_REVISION%[a-z]}" || true
+          echo "prepared"
+
+      - name: Build librusty_v8 from source for aarch64-linux-android
+        shell: bash
+        env:
+          V8_FROM_SOURCE: "1"
+          LIBCLANG_PATH: /usr/lib/llvm-19/lib
+          CARGO_TARGET_DIR: ${{ runner.temp }}/v8-target
+          RUST_BACKTRACE: '1'
+          PRINT_GN_ARGS: '1'
+          CHROMIUM_BINDGEN_STRIP_HOST_X64_FLAGS_FOR_ANDROID: '1'
+        run: |
+          set -Eeuo pipefail
+          build_dir="$RUNNER_TEMP/v8-build-crate"
+          mkdir -p "$build_dir/src"
+          printf '[package]\nname = "v8-android-build"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nv8 = "=%s"\n\n[patch.crates-io]\nv8 = { path = "%s" }\n' \
+            "${V8_VERSION}" "$RV8_SRC" > "$build_dir/Cargo.toml"
+          printf 'fn main() {}\n' > "$build_dir/src/main.rs"
+          cd "$build_dir"
+          cargo +"${RUST_VERSION}" build --target "${ANDROID_TARGET}" --release -vv 2>&1 | tail -200
+
+      - name: Locate and package artifacts
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/v8-target
+        run: |
+          set -Eeuo pipefail
+          archive_file="${CARGO_TARGET_DIR}/${ANDROID_TARGET}/release/gn_out/obj/librusty_v8.a"
+          binding_file="${CARGO_TARGET_DIR}/${ANDROID_TARGET}/release/gn_out/src_binding.rs"
+          test -f "$archive_file" || { echo 'ERROR: archive not found'; find "$CARGO_TARGET_DIR" -name '*.a' 2>/dev/null | head -20; exit 1; }
+          test -f "$binding_file" || { echo 'ERROR: binding not found'; exit 1; }
+          out="$RUNNER_TEMP/rusty-v8-artifacts"; mkdir -p "$out"
+          gzip -c "$archive_file" > "$out/librusty_v8_release_${ANDROID_TARGET}.a.gz"
+          cp "$binding_file" "$out/src_binding_release_${ANDROID_TARGET}.rs"
+          ls -la "$out"
+          sha256sum "$out"/* | tee "$out/SHA256SUMS"
+          echo "ARTIFACTS_DIR=$out" >> "$GITHUB_ENV"
+
+      - name: Create release and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --title "rusty_v8 $V8_VERSION for $ANDROID_TARGET" \
+              --notes "Prebuilt librusty_v8 for $ANDROID_TARGET (V8 $V8_VERSION, NDK $NDK_REVISION, API $ANDROID_API_LEVEL). Built from source by this workflow."
+          gh release upload "$RELEASE_TAG" "$ARTIFACTS_DIR"/* --clobber
+          echo "uploaded to $RELEASE_TAG"
