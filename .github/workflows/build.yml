@@ -44,6 +44,17 @@ jobs:
             /usr/local/lib/android /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
           df -h
 
+      - name: Add LLVM 19 apt repository
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends wget ca-certificates gnupg
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list
+          sudo apt-get update -qq
+
       - name: Install system dependencies
         run: |
           set -eu
